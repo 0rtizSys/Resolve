@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 
 use super::error::ValidationError;
+use super::schedule::Schedule;
 
 /// Identifier of a persisted task.
 pub type TaskId = i64;
@@ -21,6 +22,8 @@ pub struct Task {
     pub created_at: DateTime<Utc>,
     /// `Some` once the task has been checked.
     pub completed_at: Option<DateTime<Utc>>,
+    /// When the task is planned in the calendar, if it is.
+    pub schedule: Option<Schedule>,
 }
 
 impl Task {

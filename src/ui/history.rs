@@ -5,12 +5,29 @@ use eframe::egui::{
     Align, CornerRadius, Layout, RichText, ScrollArea, Sense, Ui, UiBuilder, emath::easing, vec2,
 };
 
-use super::{theme, widgets};
+use super::{motion, theme, widgets};
 use crate::core::{DisciplineEvent, EventId, EventKind};
 
 const ROW_HEIGHT: f32 = 28.0;
 /// How long a freshly added entry stays highlighted, in seconds.
 const HIGHLIGHT_SECONDS: f64 = 1.6;
+
+/// Events from a period picked in the chart, which the history highlights.
+#[derive(Clone, Copy)]
+pub struct PeriodSelection {
+    pub start: NaiveDate,
+    /// Exclusive.
+    pub end: NaiveDate,
+    /// Scroll to the first highlighted event (set on the frame the selection changes).
+    pub scroll: bool,
+}
+
+impl PeriodSelection {
+    fn contains(&self, event: &DisciplineEvent) -> bool {
+        let date = event.occurred_at.with_timezone(&Local).date_naive();
+        (self.start..self.end).contains(&date)
+    }
+}
 
 enum Row<'a> {
     Day(NaiveDate),
@@ -24,6 +41,7 @@ pub fn show(
     highlight: Option<(EventId, f64)>,
     today: NaiveDate,
     max_height: f32,
+    selection: Option<PeriodSelection>,
 ) {
     ui.horizontal(|ui| {
         theme::caption(ui, "History");
@@ -45,44 +63,66 @@ pub fn show(
 
     let rows = rows(events);
     let now = ui.input(|i| i.time);
-    ScrollArea::vertical()
+    let highlight = highlight.filter(|_| !motion::reduced_motion(ui.ctx()));
+    let mut scroll = ScrollArea::vertical()
         .id_salt("history")
         .auto_shrink([false, false])
         .max_height(max_height)
-        .stick_to_bottom(true)
-        .show_rows(ui, ROW_HEIGHT, rows.len(), |ui, range| {
-            for row in &rows[range] {
-                let (rect, _) =
-                    ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::hover());
-                let mut row_ui = ui.new_child(
-                    UiBuilder::new()
-                        .max_rect(rect.shrink2(vec2(8.0, 0.0)))
-                        .layout(Layout::left_to_right(Align::Center)),
-                );
-                match row {
-                    Row::Day(date) => {
-                        row_ui.add_space(-8.0);
-                        theme::caption(&mut row_ui, &day_label(*date, today));
+        .stick_to_bottom(true);
+    if let Some(selection) = selection.filter(|s| s.scroll)
+        && let Some(first) = rows
+            .iter()
+            .position(|row| matches!(row, Row::Event(e) if selection.contains(e)))
+    {
+        // Land with the period's day header just above the first event.
+        let row_pitch = ROW_HEIGHT + ui.spacing().item_spacing.y;
+        scroll = scroll.vertical_scroll_offset(first.saturating_sub(1) as f32 * row_pitch);
+    }
+    scroll.show_rows(ui, ROW_HEIGHT, rows.len(), |ui, range| {
+        for row in &rows[range] {
+            let (rect, _) =
+                ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::hover());
+            let mut row_ui = ui.new_child(
+                UiBuilder::new()
+                    .max_rect(rect.shrink2(vec2(8.0, 0.0)))
+                    .layout(Layout::left_to_right(Align::Center)),
+            );
+            match row {
+                Row::Day(date) => {
+                    row_ui.add_space(-8.0);
+                    theme::caption(&mut row_ui, &day_label(*date, today));
+                }
+                Row::Event(event) => {
+                    if selection.is_some_and(|s| s.contains(event)) {
+                        ui.painter().rect_filled(
+                            rect,
+                            CornerRadius::same(5),
+                            theme::ACCENT.gamma_multiply(0.06),
+                        );
+                        ui.painter().vline(
+                            rect.left() + 1.0,
+                            rect.y_range().shrink(6.0),
+                            eframe::egui::Stroke::new(2.0, theme::ACCENT.gamma_multiply(0.7)),
+                        );
                     }
-                    Row::Event(event) => {
-                        if let Some((id, since)) = highlight
-                            && id == event.id
-                            && now - since < HIGHLIGHT_SECONDS
-                        {
-                            let t = ((now - since) / HIGHLIGHT_SECONDS) as f32;
-                            let alpha = 0.12 * (1.0 - easing::quadratic_in(t));
-                            ui.painter().rect_filled(
-                                rect,
-                                CornerRadius::same(5),
-                                theme::points_color(event.points).gamma_multiply(alpha),
-                            );
-                            ui.ctx().request_repaint();
-                        }
-                        event_row(&mut row_ui, event);
+                    if let Some((id, since)) = highlight
+                        && id == event.id
+                        && now - since < HIGHLIGHT_SECONDS
+                    {
+                        let t = ((now - since) / HIGHLIGHT_SECONDS) as f32;
+                        let alpha = 0.12 * (1.0 - easing::quadratic_in(t));
+                        ui.painter().rect_filled(
+                            rect,
+                            CornerRadius::same(5),
+                            theme::points_color(event.points).gamma_multiply(alpha),
+                        );
+                        ui.ctx().request_repaint();
                     }
+                    event_row(&mut row_ui, event);
                 }
             }
-        });
+        }
+    });
 }
 
 fn event_row(ui: &mut Ui, event: &DisciplineEvent) {

@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, Row, params};
 
 use crate::core::{
-    DisciplineEvent, Error, EventKind, NewEvent, NewTask, Result, Store, Task, TaskId,
+    DisciplineEvent, Error, EventKind, NewEvent, NewTask, Result, Schedule, Store, Task, TaskId,
 };
 
 /// Schema migrations, applied in order. Append new ones; never edit an existing entry.
@@ -26,6 +26,11 @@ const MIGRATIONS: &[&str] = &[
         occurred_at INTEGER NOT NULL
     );
     CREATE INDEX events_occurred_at ON events (occurred_at);",
+    // 2: manual ordering and calendar scheduling
+    "ALTER TABLE tasks ADD COLUMN position INTEGER NOT NULL DEFAULT 0;
+    UPDATE tasks SET position = id;
+    ALTER TABLE tasks ADD COLUMN scheduled_start INTEGER;
+    ALTER TABLE tasks ADD COLUMN duration_minutes INTEGER;",
 ];
 
 /// [`Store`] backed by a local SQLite database.
@@ -74,7 +79,10 @@ impl Store for SqliteStore {
     fn load_tasks(&self) -> Result<Vec<Task>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, name, points, created_at, completed_at FROM tasks ORDER BY id")
+            .prepare(
+                "SELECT id, name, points, created_at, completed_at, scheduled_start, duration_minutes
+                 FROM tasks ORDER BY position, id",
+            )
             .map_err(storage)?;
         let tasks = stmt
             .query_map([], task_from_row)
@@ -103,7 +111,8 @@ impl Store for SqliteStore {
     fn insert_task(&mut self, task: &NewTask, created_at: DateTime<Utc>) -> Result<Task> {
         self.conn
             .execute(
-                "INSERT INTO tasks (name, points, created_at) VALUES (?1, ?2, ?3)",
+                "INSERT INTO tasks (name, points, created_at, position)
+                 VALUES (?1, ?2, ?3, (SELECT COALESCE(MAX(position), 0) + 1 FROM tasks))",
                 params![task.name(), task.points(), to_millis(created_at)],
             )
             .map_err(storage)?;
@@ -113,7 +122,39 @@ impl Store for SqliteStore {
             points: task.points(),
             created_at: truncate(created_at),
             completed_at: None,
+            schedule: None,
         })
+    }
+
+    fn update_schedule(&mut self, id: TaskId, schedule: Option<Schedule>) -> Result<()> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE tasks SET scheduled_start = ?1, duration_minutes = ?2 WHERE id = ?3",
+                params![
+                    schedule.map(|s| to_millis(s.start())),
+                    schedule.map(|s| s.duration_minutes()),
+                    id
+                ],
+            )
+            .map_err(storage)?;
+        if updated == 0 {
+            return Err(Error::TaskNotFound(id));
+        }
+        Ok(())
+    }
+
+    fn update_order(&mut self, ordered: &[TaskId]) -> Result<()> {
+        let tx = self.conn.transaction().map_err(storage)?;
+        {
+            let mut stmt = tx
+                .prepare("UPDATE tasks SET position = ?1 WHERE id = ?2")
+                .map_err(storage)?;
+            for (position, id) in (1i64..).zip(ordered) {
+                stmt.execute(params![position, id]).map_err(storage)?;
+            }
+        }
+        tx.commit().map_err(storage)
     }
 
     fn delete_task(&mut self, id: TaskId) -> Result<()> {
@@ -184,7 +225,21 @@ fn task_from_row(row: &Row<'_>) -> rusqlite::Result<Task> {
         points: row.get(2)?,
         created_at: from_millis(row.get(3)?),
         completed_at: row.get::<_, Option<i64>>(4)?.map(from_millis),
+        schedule: schedule_from_row(row)?,
     })
+}
+
+fn schedule_from_row(row: &Row<'_>) -> rusqlite::Result<Option<Schedule>> {
+    let start: Option<i64> = row.get(5)?;
+    let minutes: Option<u32> = row.get(6)?;
+    let (Some(start), Some(minutes)) = (start, minutes) else {
+        return Ok(None);
+    };
+    Schedule::new(from_millis(start), minutes)
+        .map(Some)
+        .map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Integer, err.into())
+        })
 }
 
 fn event_from_row(row: &Row<'_>) -> rusqlite::Result<DisciplineEvent> {
@@ -260,6 +315,20 @@ mod tests {
         );
         assert_eq!(tracker.events().len(), 1);
         assert_eq!(tracker.events()[0].occurred_at, truncate(now));
+        drop(tracker);
+
+        // Order and schedules survive too.
+        let schedule = Schedule::new(truncate(now), 45).unwrap();
+        {
+            let mut tracker = Tracker::load(SqliteStore::open(&path).unwrap()).unwrap();
+            tracker.move_task(pending, 0).unwrap();
+            tracker.schedule_task(done, Some(schedule)).unwrap();
+            tracker.add_task("Leer", 5, now).unwrap();
+        }
+        let tracker = Tracker::load(SqliteStore::open(&path).unwrap()).unwrap();
+        let names: Vec<_> = tracker.tasks().iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["No hacer X", "Estudiar física", "Leer"]);
+        assert_eq!(tracker.tasks()[1].schedule, Some(schedule));
 
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -285,6 +354,23 @@ mod tests {
             Err(Error::TaskNotFound(_))
         ));
         assert!(store.load_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn upgrades_a_version_1_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tasks (name, points, created_at) VALUES ('A', 5, 0), ('B', -5, 0);",
+        )
+        .unwrap();
+
+        let store = SqliteStore::init(conn).unwrap();
+        let tasks = store.load_tasks().unwrap();
+        let names: Vec<_> = tasks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["A", "B"]);
+        assert!(tasks.iter().all(|t| t.schedule.is_none()));
     }
 
     #[test]

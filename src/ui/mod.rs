@@ -1,14 +1,21 @@
 //! Desktop UI. Renders state from [`Tracker`] and turns user input into tracker calls;
 //! no business rules live here.
+//!
+//! Every action follows the same path: a view emits a [`TaskAction`], [`ResolveApp::apply`]
+//! hands it to the tracker (which persists it), and the next frame renders the new state.
+//! Animations only ever move things towards what the model says.
 
+mod calendar;
 mod dashboard;
 mod history;
+mod motion;
 mod statistics;
+mod task_list;
 mod tasks;
 mod theme;
 mod widgets;
 
-use chrono::{Local, NaiveDate, Utc};
+use chrono::{Days, Local, NaiveDate, Utc};
 use eframe::egui::{self, Align, Frame, Layout, Margin, RichText, Ui, vec2};
 
 use crate::core::{self, EventId, Granularity, ScorePoint, Store, Tracker};
@@ -28,12 +35,16 @@ pub struct ResolveApp<S> {
     series: SeriesCache,
     /// Newest event and when it happened, for the history highlight.
     highlight: Option<(EventId, f64)>,
+    /// Chart period whose events are pinned and highlighted in the history.
+    selected_period: Option<NaiveDate>,
+    scroll_history: bool,
     error: Option<String>,
 }
 
 impl<S: Store> ResolveApp<S> {
     pub fn new(ctx: &egui::Context, tracker: Tracker<S>) -> Self {
         theme::apply(ctx);
+        motion::set_reduced_motion(ctx, motion::detect_reduced_motion());
         let granularity = Granularity::recommended(tracker.events(), today(), &Local);
         Self {
             tracker,
@@ -43,11 +54,13 @@ impl<S: Store> ResolveApp<S> {
             granularity,
             series: SeriesCache::default(),
             highlight: None,
+            selected_period: None,
+            scroll_history: false,
             error: None,
         }
     }
 
-    fn apply(&mut self, action: TaskAction, now: f64) {
+    fn apply(&mut self, ctx: &egui::Context, action: TaskAction, now: f64) {
         let result = match action {
             TaskAction::Add { name, points } => self
                 .tracker
@@ -58,11 +71,14 @@ impl<S: Store> ResolveApp<S> {
                 .set_completed(id, completed, Utc::now())
                 .map(|event| {
                     if let Some(event) = event {
-                        self.score.celebrate(event.points, now);
+                        if completed {
+                            self.task_panel.celebrate(ctx, id);
+                        }
+                        self.score.celebrate(ctx, event.points, now);
                         self.highlight = Some((event.id, now));
                     }
                 }),
-            TaskAction::Delete(id) => self.tracker.delete_task(id),
+            TaskAction::Delete(id) => self.delete(id, now),
             TaskAction::ClearCompleted => {
                 let done: Vec<_> = self
                     .tracker
@@ -71,9 +87,10 @@ impl<S: Store> ResolveApp<S> {
                     .filter(|task| task.is_completed())
                     .map(|task| task.id)
                     .collect();
-                done.into_iter()
-                    .try_for_each(|id| self.tracker.delete_task(id))
+                done.into_iter().try_for_each(|id| self.delete(id, now))
             }
+            TaskAction::Move { id, to } => self.tracker.move_task(id, to),
+            TaskAction::Schedule { id, schedule } => self.tracker.schedule_task(id, schedule),
         };
 
         match result {
@@ -81,6 +98,15 @@ impl<S: Store> ResolveApp<S> {
             Err(core::Error::Validation(err)) => self.task_panel.show_error(err.to_string(), now),
             Err(err) => self.error = Some(err.to_string()),
         }
+    }
+
+    fn delete(&mut self, id: core::TaskId, now: f64) -> core::Result<()> {
+        let task = self.tracker.tasks().iter().find(|t| t.id == id).cloned();
+        self.tracker.delete_task(id)?;
+        if let Some(task) = task {
+            self.task_panel.removed(task, now);
+        }
+        Ok(())
     }
 
     fn header(&self, ui: &mut Ui) {
@@ -104,8 +130,9 @@ impl<S: Store> ResolveApp<S> {
         ui.add_space(28.0);
 
         let actions = self.task_panel.show(ui, self.tracker.tasks());
+        let ctx = ui.ctx().clone();
         for action in actions {
-            self.apply(action, now);
+            self.apply(&ctx, action, now);
         }
     }
 
@@ -115,9 +142,27 @@ impl<S: Store> ResolveApp<S> {
         let series = self
             .series
             .get(self.tracker.events(), self.granularity, today);
-        if let Some(picked) = self.chart.show(ui, series, self.granularity, chart_height) {
+        let response = self.chart.show(
+            ui,
+            series,
+            self.tracker.events(),
+            self.granularity,
+            self.selected_period,
+            chart_height,
+        );
+        if let Some(picked) = response.granularity {
             self.granularity = picked;
+            self.selected_period = None;
         }
+        if let Some(selected) = response.selected {
+            self.selected_period = selected;
+            self.scroll_history = selected.is_some();
+        }
+        let selection = self.selected_period.map(|start| history::PeriodSelection {
+            start,
+            end: start + Days::new(self.granularity.days()),
+            scroll: std::mem::take(&mut self.scroll_history),
+        });
         ui.add_space(20.0);
         widgets::separator(ui);
         ui.add_space(14.0);
@@ -128,6 +173,7 @@ impl<S: Store> ResolveApp<S> {
             self.highlight,
             today,
             history_height,
+            selection,
         );
     }
 

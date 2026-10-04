@@ -7,19 +7,40 @@ use eframe::egui::{
     Ui, Vec2, emath::easing, pos2, vec2,
 };
 
-use super::theme;
+use super::{motion, theme};
 
-/// An animated checkbox: the box fills, the check mark draws itself and a soft ring
-/// expands outwards when it gets checked.
-pub fn check_box(ui: &mut Ui, checked: bool, color: Color32) -> Response {
+/// An animated checkbox: the box fills, the check mark draws itself, the box springs a
+/// little and a soft ring expands outwards when it gets checked.
+///
+/// `id` must be stable for the thing being checked (not its position), so the animation
+/// state follows it when rows move.
+pub fn check_box(ui: &mut Ui, id: egui::Id, checked: bool, color: Color32) -> Response {
     let size = Vec2::splat(20.0);
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let response = ui.interact(rect, id, Sense::click());
     if !ui.is_rect_visible(rect) {
         return response;
     }
 
-    let progress = ui.ctx().animate_bool_with_time(response.id, checked, 0.22);
+    let ctx = ui.ctx();
+    let progress = motion::animate_bool(ctx, response.id, checked, 0.22);
     let eased = easing::cubic_out(progress);
+
+    // Kick a spring whenever the state flips, so the box "pops" and settles.
+    let state_id = response.id.with("state");
+    let previous = ctx.data_mut(|d| {
+        let previous = d.get_temp::<bool>(state_id);
+        d.insert_temp(state_id, checked);
+        previous
+    });
+    if previous.is_some_and(|was| was != checked) {
+        motion::kick(
+            ctx,
+            response.id.with("pop"),
+            if checked { 60.0 } else { -25.0 },
+        );
+    }
+    let pop = motion::spring(ctx, response.id.with("pop"), 0.0, motion::BOUNCY);
     let painter = ui.painter();
 
     // Ring that expands and fades out right after checking.
@@ -33,9 +54,7 @@ pub fn check_box(ui: &mut Ui, checked: bool, color: Color32) -> Response {
         );
     }
 
-    // A tiny "pop" while transitioning.
-    let pop = (progress * PI).sin() * 1.5;
-    let box_rect = rect.expand(pop);
+    let box_rect = rect.expand(pop.clamp(-3.0, 4.0));
     let border = if response.hovered() {
         lerp_color(theme::MUTED, color, eased)
     } else {
@@ -62,16 +81,28 @@ pub fn check_box(ui: &mut Ui, checked: bool, color: Color32) -> Response {
 }
 
 /// Signed points rendered as a compact monospace pill.
-pub fn points_badge(ui: &mut Ui, points: i64, dimmed: f32) -> Response {
+///
+/// `scale` grows the pill around its center without changing the layout, for "pop" effects.
+pub fn points_badge(ui: &mut Ui, points: i64, dimmed: f32, scale: f32) -> Response {
     let color = theme::points_color(points).gamma_multiply(1.0 - 0.55 * dimmed);
-    let galley =
-        ui.painter()
-            .layout_no_wrap(theme::format_points(points), theme::mono(13.0), color);
+    let text = theme::format_points(points);
     let padding = vec2(8.0, 3.0);
-    let (rect, response) = ui.allocate_exact_size(galley.size() + padding * 2.0, Sense::hover());
+    let size = ui
+        .painter()
+        .layout_no_wrap(text.clone(), theme::mono(13.0), color)
+        .size()
+        + padding * 2.0;
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+
+    let scale = scale.clamp(0.8, 1.3);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text, theme::mono(13.0 * scale), color);
+    let shown = Rect::from_center_size(rect.center(), size * scale);
     ui.painter()
-        .rect_filled(rect, CornerRadius::same(5), color.gamma_multiply(0.09));
-    ui.painter().galley(rect.min + padding, galley, color);
+        .rect_filled(shown, CornerRadius::same(5), color.gamma_multiply(0.09));
+    ui.painter()
+        .galley(shown.center() - galley.size() / 2.0, galley, color);
     response
 }
 
@@ -81,6 +112,8 @@ pub enum Glyph {
     Check,
     Cross,
     Undo,
+    ChevronLeft,
+    ChevronRight,
 }
 
 pub fn glyph(ui: &mut Ui, glyph: Glyph, color: Color32) -> Response {
@@ -122,6 +155,19 @@ fn paint_glyph(painter: &Painter, rect: Rect, glyph: Glyph, color: Color32) {
         Glyph::Cross => {
             painter.line_segment([r.left_top(), r.right_bottom()], stroke);
             painter.line_segment([r.right_top(), r.left_bottom()], stroke);
+        }
+        Glyph::ChevronLeft | Glyph::ChevronRight => {
+            let (tip, back) = if glyph == Glyph::ChevronLeft {
+                (0.3, 0.65)
+            } else {
+                (0.7, 0.35)
+            };
+            let points = vec![
+                r.lerp_inside(vec2(back, 0.1)),
+                r.lerp_inside(vec2(tip, 0.5)),
+                r.lerp_inside(vec2(back, 0.9)),
+            ];
+            painter.add(Shape::line(points, stroke));
         }
         Glyph::Undo => {
             let center = r.center();

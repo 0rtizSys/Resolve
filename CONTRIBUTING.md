@@ -36,6 +36,7 @@ cargo test
 - Add a test for any change to `core` or `persistence`.
 - Prefer the standard library and existing dependencies. A new crate needs a good reason.
 - Keep animations subtle and cheap: only request repaints while something is actually moving.
+  Use the helpers in `src/ui/motion.rs` so the reduced-motion setting keeps working.
 - Write commit messages that explain *why*, not just *what*.
 
 By contributing you agree that your work is released under the [MIT License](LICENSE).

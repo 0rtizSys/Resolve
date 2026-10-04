@@ -2,12 +2,16 @@ use chrono::{DateTime, Utc};
 
 use super::error::{Error, Result};
 use super::event::{DisciplineEvent, EventKind, NewEvent};
+use super::schedule::Schedule;
 use super::score::DisciplineScore;
 use super::store::Store;
 use super::task::{NewTask, Task, TaskId};
 
 /// The application's single source of truth: tasks, history and score, kept in sync with a
 /// [`Store`]. Every mutation is persisted before the in-memory state changes.
+///
+/// This is the only place that turns a task completion into a [`DisciplineEvent`] and applies
+/// it to the score. Dashboard, history and statistics all read from the same event log here.
 pub struct Tracker<S> {
     store: S,
     tasks: Vec<Task>,
@@ -91,6 +95,33 @@ impl<S: Store> Tracker<S> {
         Ok(Some(event))
     }
 
+    /// Places a task in the calendar, moves it, resizes it or (with `None`) unschedules it.
+    pub fn schedule_task(&mut self, id: TaskId, schedule: Option<Schedule>) -> Result<()> {
+        let index = self.index_of(id)?;
+        if self.tasks[index].schedule == schedule {
+            return Ok(());
+        }
+        self.store.update_schedule(id, schedule)?;
+        self.tasks[index].schedule = schedule;
+        Ok(())
+    }
+
+    /// Moves a task to `to_index` in the list, shifting the others.
+    pub fn move_task(&mut self, id: TaskId, to_index: usize) -> Result<()> {
+        let from = self.index_of(id)?;
+        let to = to_index.min(self.tasks.len() - 1);
+        if from == to {
+            return Ok(());
+        }
+        let mut reordered = self.tasks.clone();
+        let task = reordered.remove(from);
+        reordered.insert(to, task);
+        let ids: Vec<TaskId> = reordered.iter().map(|task| task.id).collect();
+        self.store.update_order(&ids)?;
+        self.tasks = reordered;
+        Ok(())
+    }
+
     fn index_of(&self, id: TaskId) -> Result<usize> {
         self.tasks
             .iter()
@@ -129,9 +160,26 @@ pub(crate) mod tests {
                 points: task.points(),
                 created_at,
                 completed_at: None,
+                schedule: None,
             };
             self.tasks.push(task.clone());
             Ok(task)
+        }
+
+        fn update_schedule(&mut self, id: TaskId, schedule: Option<Schedule>) -> Result<()> {
+            let task = self
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == id)
+                .ok_or(Error::TaskNotFound(id))?;
+            task.schedule = schedule;
+            Ok(())
+        }
+
+        fn update_order(&mut self, ordered: &[TaskId]) -> Result<()> {
+            self.tasks
+                .sort_by_key(|task| ordered.iter().position(|id| *id == task.id));
+            Ok(())
         }
 
         fn delete_task(&mut self, id: TaskId) -> Result<()> {
@@ -221,6 +269,52 @@ pub(crate) mod tests {
             tracker.set_completed(id, false, now),
             Err(Error::TaskNotFound(_))
         ));
+    }
+
+    #[test]
+    fn scheduling_and_reordering_are_persisted() {
+        let mut tracker = tracker();
+        let now = Utc::now();
+        let a = tracker.add_task("A", 5, now).unwrap().id;
+        let b = tracker.add_task("B", 5, now).unwrap().id;
+        let c = tracker.add_task("C", 5, now).unwrap().id;
+
+        let schedule = Schedule::new(now, 60).unwrap();
+        tracker.schedule_task(b, Some(schedule)).unwrap();
+        tracker.move_task(c, 0).unwrap();
+
+        let order: Vec<_> = tracker.tasks().iter().map(|t| t.id).collect();
+        assert_eq!(order, vec![c, a, b]);
+        assert_eq!(tracker.tasks()[2].schedule, Some(schedule));
+
+        // A fresh tracker over the same store sees the same state.
+        let reloaded = Tracker::load(tracker.store).unwrap();
+        let order: Vec<_> = reloaded.tasks().iter().map(|t| t.id).collect();
+        assert_eq!(order, vec![c, a, b]);
+        assert_eq!(reloaded.tasks()[2].schedule, Some(schedule));
+    }
+
+    #[test]
+    fn score_chart_and_history_agree() {
+        use crate::core::statistics::{Granularity, score_over_time};
+
+        let mut tracker = tracker();
+        let now = Utc::now();
+        for (name, points) in [("Física", 10), ("Cuarto", 5), ("X", -5)] {
+            let id = tracker.add_task(name, points, now).unwrap().id;
+            tracker.set_completed(id, true, now).unwrap();
+        }
+        let first = tracker.tasks()[0].id;
+        tracker.set_completed(first, false, now).unwrap();
+
+        let history_total: i64 = tracker.events().iter().map(|e| e.points).sum();
+        let today = now.date_naive();
+        for granularity in [Granularity::Daily, Granularity::Weekly] {
+            let series = score_over_time(tracker.events(), granularity, today, &Utc);
+            assert_eq!(series.last().unwrap().score, tracker.score().total());
+        }
+        assert_eq!(history_total, tracker.score().total());
+        assert_eq!(tracker.score().total(), 0);
     }
 
     #[test]
