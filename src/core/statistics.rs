@@ -19,6 +19,22 @@ pub enum Granularity {
 }
 
 impl Granularity {
+    /// Length of one period, in days.
+    pub fn days(self) -> u64 {
+        match self {
+            Self::Daily => 1,
+            Self::Weekly => 7,
+        }
+    }
+
+    /// First day of the period that contains `date`.
+    pub fn period_start(self, date: NaiveDate) -> NaiveDate {
+        match self {
+            Self::Daily => date,
+            Self::Weekly => week_start(date),
+        }
+    }
+
     /// Weekly once the daily view would hide more than half of the history.
     pub fn recommended<Tz: TimeZone>(
         events: &[DisciplineEvent],
@@ -57,10 +73,12 @@ pub fn score_over_time<Tz: TimeZone>(
     today: NaiveDate,
     tz: &Tz,
 ) -> Vec<ScorePoint> {
-    let (count, step, last_start) = match granularity {
-        Granularity::Daily => (DAILY_PERIODS, 1, today),
-        Granularity::Weekly => (WEEKLY_PERIODS, 7, week_start(today)),
+    let count = match granularity {
+        Granularity::Daily => DAILY_PERIODS,
+        Granularity::Weekly => WEEKLY_PERIODS,
     };
+    let step = granularity.days();
+    let last_start = granularity.period_start(today);
     let first_start = last_start - Days::new(step * (count - 1));
 
     let mut dated: Vec<(NaiveDate, i64)> = events
@@ -97,6 +115,21 @@ pub fn score_over_time<Tz: TimeZone>(
         .min(series.len().saturating_sub(MIN_PERIODS));
     series.drain(..drop);
     series
+}
+
+/// The events that happened during the period starting on `period_start`, oldest first.
+/// These are exactly the events behind the change of one point of [`score_over_time`].
+pub fn events_in_period<'a, Tz: TimeZone>(
+    events: &'a [DisciplineEvent],
+    period_start: NaiveDate,
+    granularity: Granularity,
+    tz: &Tz,
+) -> Vec<&'a DisciplineEvent> {
+    let end = period_start + Days::new(granularity.days());
+    events
+        .iter()
+        .filter(|event| (period_start..end).contains(&local_date(event, tz)))
+        .collect()
 }
 
 /// Net points earned from Monday of the current week until `today` (inclusive).
@@ -197,6 +230,29 @@ mod tests {
         let empty = score_over_time(&[], Granularity::Daily, today, &Utc);
         assert_eq!(empty.len(), MIN_PERIODS);
         assert!(empty.iter().all(|p| p.score == 0));
+    }
+
+    #[test]
+    fn period_breakdown_matches_the_series() {
+        let today = day(2026, 10, 1);
+        let events = [
+            event_on(day(2026, 9, 29), 5),
+            event_on(day(2026, 9, 30), 10),
+            event_on(day(2026, 9, 30), -5),
+            event_on(day(2026, 10, 1), 15),
+        ];
+        for granularity in [Granularity::Daily, Granularity::Weekly] {
+            let series = score_over_time(&events, granularity, today, &Utc);
+            for pair in series.windows(2) {
+                let net: i64 = events_in_period(&events, pair[1].period_start, granularity, &Utc)
+                    .iter()
+                    .map(|e| e.points)
+                    .sum();
+                assert_eq!(pair[1].score - pair[0].score, net);
+            }
+        }
+        let tuesday = events_in_period(&events, day(2026, 9, 30), Granularity::Daily, &Utc);
+        assert_eq!(tuesday.len(), 2);
     }
 
     #[test]

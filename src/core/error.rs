@@ -7,6 +7,7 @@ pub enum ValidationError {
     NameTooLong,
     ZeroPoints,
     PointsOutOfRange,
+    DurationOutOfRange,
 }
 
 impl fmt::Display for ValidationError {
@@ -16,6 +17,7 @@ impl fmt::Display for ValidationError {
             Self::NameTooLong => "Task name is too long",
             Self::ZeroPoints => "A task must be worth at least 1 point",
             Self::PointsOutOfRange => "Points must be between -1000 and +1000",
+            Self::DurationOutOfRange => "A block must last between 15 minutes and 24 hours",
         };
         f.write_str(message)
     }

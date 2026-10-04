@@ -2,7 +2,7 @@
 
 use eframe::egui::{self, Align2, RichText, Ui, emath::easing, vec2};
 
-use super::{theme, widgets};
+use super::{motion, theme, widgets};
 
 /// How long a "+5" pulse fades in.
 const PULSE_APPEAR: f64 = 0.18;
@@ -26,8 +26,11 @@ struct Pulse {
 
 impl ScoreDisplay {
     /// Shows `delta` next to the score for a moment before it is added to the number.
-    pub fn celebrate(&mut self, delta: i64, now: f64) {
-        self.pulses.push(Pulse { delta, born: now });
+    /// With reduced motion the number simply updates; there is no floating pulse.
+    pub fn celebrate(&mut self, ctx: &egui::Context, delta: i64, now: f64) {
+        if !motion::reduced_motion(ctx) {
+            self.pulses.push(Pulse { delta, born: now });
+        }
     }
 
     pub fn show(&mut self, ui: &mut Ui, total: i64, this_week: i64) {
@@ -44,7 +47,11 @@ impl ScoreDisplay {
             .sum();
         let target = (total - floating) as f64;
         let count = self.count.get_or_insert(Tween::settled(target));
-        count.retarget(target, now);
+        if motion::reduced_motion(ui.ctx()) {
+            *count = Tween::settled(target);
+        } else {
+            count.retarget(target, now);
+        }
         let shown = count.value(now).round() as i64;
         let counting = !count.is_settled(now);
 

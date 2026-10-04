@@ -1,24 +1,52 @@
-//! Task creation form and task list.
+//! Tasks section: creation form plus two views of the same tasks, a list and a day calendar.
 
 use eframe::egui::{
-    self, Align, CornerRadius, Frame, Key, Layout, Margin, RichText, ScrollArea, Sense, Stroke,
-    TextEdit, Ui, UiBuilder, vec2,
+    self, Align, CornerRadius, Frame, Id, Key, Layout, Margin, RichText, Stroke, TextEdit, Ui,
 };
 
-use super::{theme, widgets};
-use crate::core::{Task, TaskId};
+use super::calendar::Calendar;
+use super::task_list::TaskList;
+use super::{motion, theme, widgets};
+use crate::core::{Schedule, Task, TaskId};
 
-/// Something the user asked for in the tasks section.
+/// Something the user asked for in the tasks section. The app turns each one into a single
+/// [`crate::core::Tracker`] call; views never change state themselves.
 pub enum TaskAction {
-    Add { name: String, points: i64 },
-    SetCompleted { id: TaskId, completed: bool },
+    Add {
+        name: String,
+        points: i64,
+    },
+    SetCompleted {
+        id: TaskId,
+        completed: bool,
+    },
     Delete(TaskId),
     ClearCompleted,
+    /// Move a task to another position in the list.
+    Move {
+        id: TaskId,
+        to: usize,
+    },
+    /// Place a task in the calendar, move or resize it there, or (`None`) take it out.
+    Schedule {
+        id: TaskId,
+        schedule: Option<Schedule>,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    List,
+    Calendar,
+}
+
+/// Spring used for the short "pop" a task gets when it is completed or dropped.
+pub fn pop_id(id: TaskId) -> Id {
+    Id::new(("task_pop", id))
 }
 
 /// How long an inline error stays visible, in seconds.
 const ERROR_SECONDS: f64 = 4.0;
-const ROW_HEIGHT: f32 = 42.0;
 const DEFAULT_POINTS: &str = "+5";
 
 pub struct TaskPanel {
@@ -26,6 +54,9 @@ pub struct TaskPanel {
     points: String,
     error: Option<(String, f64)>,
     focus_name: bool,
+    view: View,
+    list: TaskList,
+    calendar: Calendar,
 }
 
 impl Default for TaskPanel {
@@ -35,6 +66,9 @@ impl Default for TaskPanel {
             points: DEFAULT_POINTS.to_owned(),
             error: None,
             focus_name: true,
+            view: View::List,
+            list: TaskList::default(),
+            calendar: Calendar::default(),
         }
     }
 }
@@ -42,6 +76,16 @@ impl Default for TaskPanel {
 impl TaskPanel {
     pub fn show_error(&mut self, message: String, now: f64) {
         self.error = Some((message, now));
+    }
+
+    /// Feedback for a completed task: the row (or calendar block) pops.
+    pub fn celebrate(&self, ctx: &egui::Context, id: TaskId) {
+        motion::kick(ctx, pop_id(id), 9.0);
+    }
+
+    /// Lets a deleted task fade out where it was instead of vanishing.
+    pub fn removed(&mut self, task: Task, now: f64) {
+        self.list.removed(task, now);
     }
 
     /// Clears the name after a successful add, keeping the points for quick repeated entry.
@@ -65,16 +109,23 @@ impl TaskPanel {
                         .color(theme::FAINT),
                 );
             }
-            if done > 0 {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for (view, label) in [(View::Calendar, "Day"), (View::List, "List")] {
+                    if widgets::toggle_label(ui, label, self.view == view).clicked() {
+                        self.view = view;
+                    }
+                }
+                if done > 0 && self.view == View::List {
+                    ui.add_space(10.0);
                     if widgets::toggle_label(ui, "Clear done", false)
                         .on_hover_text("Remove completed tasks. Their history is kept.")
                         .clicked()
                     {
                         actions.push(TaskAction::ClearCompleted);
                     }
-                });
-            }
+                }
+            });
         });
         ui.add_space(4.0);
 
@@ -84,6 +135,10 @@ impl TaskPanel {
         self.inline_error(ui);
         ui.add_space(6.0);
 
+        if self.view == View::Calendar {
+            self.calendar.show(ui, tasks, &mut actions);
+            return actions;
+        }
         if tasks.is_empty() {
             ui.add_space(12.0);
             ui.label(
@@ -95,16 +150,7 @@ impl TaskPanel {
             return actions;
         }
 
-        ScrollArea::vertical()
-            .id_salt("tasks")
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                for task in tasks {
-                    if let Some(action) = task_row(ui, task) {
-                        actions.push(action);
-                    }
-                }
-            });
+        self.list.show(ui, tasks, &mut actions);
         actions
     }
 
@@ -203,66 +249,6 @@ impl TaskPanel {
             ui.ctx().request_repaint();
         }
     }
-}
-
-fn task_row(ui: &mut Ui, task: &Task) -> Option<TaskAction> {
-    let mut action = None;
-    let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(vec2(width, ROW_HEIGHT), Sense::hover());
-    let hovered = ui.rect_contains_pointer(rect);
-    let id = ui.id().with(("task", task.id));
-    let done = ui
-        .ctx()
-        .animate_bool_with_time(id.with("done"), task.is_completed(), 0.25);
-
-    if hovered {
-        ui.painter()
-            .rect_filled(rect, CornerRadius::same(6), theme::SURFACE);
-    }
-
-    let mut row = ui.new_child(
-        UiBuilder::new()
-            .max_rect(rect.shrink2(vec2(10.0, 0.0)))
-            .layout(Layout::left_to_right(Align::Center)),
-    );
-    let color = theme::points_color(task.points);
-    if widgets::check_box(&mut row, task.is_completed(), color).clicked() {
-        action = Some(TaskAction::SetCompleted {
-            id: task.id,
-            completed: !task.is_completed(),
-        });
-    }
-    row.add_space(10.0);
-
-    row.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        if widgets::glyph_button(ui, widgets::Glyph::Cross, theme::NEGATIVE, hovered)
-            .on_hover_text("Delete task")
-            .clicked()
-        {
-            action = Some(TaskAction::Delete(task.id));
-        }
-        ui.add_space(2.0);
-        widgets::points_badge(ui, task.points, done);
-        ui.add_space(8.0);
-
-        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-            let text_color = widgets::lerp_color(theme::TEXT, theme::FAINT, done);
-            let label = ui.add(
-                egui::Label::new(RichText::new(&task.name).color(text_color))
-                    .truncate()
-                    .selectable(false),
-            );
-            if done > 0.0 {
-                let r = label.rect;
-                ui.painter().hline(
-                    r.left()..=r.left() + r.width() * done,
-                    r.center().y + 1.0,
-                    Stroke::new(1.2, theme::FAINT),
-                );
-            }
-        });
-    });
-    action
 }
 
 /// Parses user input such as `+10`, `10`, `-5` or `−5`.

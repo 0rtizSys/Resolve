@@ -2,6 +2,7 @@
 
 pub mod error;
 pub mod event;
+pub mod schedule;
 pub mod score;
 pub mod statistics;
 pub mod store;
@@ -10,6 +11,7 @@ pub mod tracker;
 
 pub use error::{Error, Result};
 pub use event::{DisciplineEvent, EventId, EventKind, NewEvent};
+pub use schedule::Schedule;
 pub use statistics::{Granularity, ScorePoint};
 pub use store::Store;
 pub use task::{NewTask, Task, TaskId};
